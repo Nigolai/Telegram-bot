@@ -240,34 +240,50 @@ async def check_reminders():
 
         await asyncio.sleep(10)
 
+# === ОБРАБОТЧИК ВЕБХУКА ===
+async def handle_webhook(request):
+    try:
+        update_json = await request.json()
+        update = types.Update(**update_json)
+        await dp.feed_update(bot, update)
+        return web.Response(status=200)
+    except Exception as e:
+        print(f"❌ Ошибка в вебхуке: {e}")
+        import traceback
+        traceback.print_exc()
+        return web.Response(status=500)
 
-# === МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы не было SIGTERM) ===
-app = web.Application()
-app.router.add_get("/", lambda _: web.Response(text="OK", status=200))
-app.router.add_get("/health", lambda _: web.Response(text="OK", status=200))
-
-# === ЗАПУСК ===
+# === ЗАПУСК НА RENDER С ВЕБХУКОМ ===
 async def main():
-    print("🚀 Запуск бота...")
+    print("🚀 Запуск бота в режиме вебхука...")
 
-    print("🔧 1. Инициализация базы данных...")
+    # Инициализация
     await init_db()
-
-    print("🔧 2. Запуск фоновой проверки напоминаний...")
     asyncio.create_task(check_reminders())
 
-    # Запуск веб-сервера
-    print("🔧 3. Запуск веб-сервера для Render...")
+    # Веб-приложение
+    app = web.Application()
+    app.router.add_post(f"/{TOKEN}", handle_webhook)  # Telegram будет слать сюда
+    app.router.add_get("/", lambda _: web.Response(text="OK", status=200))
+    app.router.add_get("/health", lambda _: web.Response(text="OK", status=200))
+
+    # Настройка сервера
     runner = web.AppRunner(app)
     await runner.setup()
+
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"🌐 Веб-сервер запущен на порту {port}")
 
-    # Запуск бота
-    print("🚀 4. Запуск polling...")
-    await dp.start_polling(bot)
+    # Установка вебхука
+    webhook_url = f"https://Telegram-bot.onrender.com/{TOKEN}"
+    await bot.set_webhook(webhook_url, allowed_updates=dp.resolve_used_update_types())
+    print(f"🔧 Вебхук установлен: {webhook_url}")
+
+    # Держим процесс живым
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
