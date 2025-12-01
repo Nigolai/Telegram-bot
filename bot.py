@@ -1,4 +1,6 @@
 # bot.py — Напоминалка с повторами и удалением
+
+# === ИМПОРТЫ В НАЧАЛЕ ===
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -9,15 +11,25 @@ import os
 from datetime import datetime, timedelta
 import random
 
-# === НАСТРОЙКИ ===
+# === ЗАГРУЗКА ТОКЕНА ===
 from dotenv import load_dotenv
-import os
 
-load_dotenv()  # не обязателен на Render, но оставь
+# Загружаем переменные (нужно до создания бота)
+load_dotenv()
+
+# Получаем токен
 TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ Не установлен BOT_TOKEN в переменных окружения!")
 
+# === СОЗДАЁМ БОТА И ДИСПЕТЧЕР ===
+# 🔥 ВАЖНО: создавать ДО использования @dp
+bot = Bot(token=TOKEN)
+dp = Dispatcher()  # ✅ Вот он — dp! Теперь он определён
 
-# === КНОПКИ ===
+# === НАСТРОЙКИ ===
+
+# Кнопки
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -195,12 +207,14 @@ async def check_reminders():
                 await bot.send_message(r["user_id"], f"🔔 Напоминание:\n{r['message']}")
             except Exception as e:
                 print(f"Ошибка отправки: {e}")
-                reminders.remove(r)
+                if r in reminders:
+                    reminders.remove(r)
                 await save_reminders()
                 continue
 
             # Удаляем старое
-            reminders.remove(r)
+            if r in reminders:
+                reminders.remove(r)
 
             # Если нужен повтор — создаём новое
             repeat = r.get("repeat", "none")
@@ -211,16 +225,15 @@ async def check_reminders():
             elif repeat == "weekly":
                 new_time = now + timedelta(weeks=1)
             elif repeat == "monthly":
-                # Простое добавление 30 дней (для упрощения)
-                new_time = now + timedelta(days=30)
+                new_time = now + timedelta(days=30)  # упрощённо
 
-            if new_time and new_time:
+            if new_time:
                 new_rem = r.copy()
-                new_rem["time"] = new_time.replace(hour=new_time.hour, minute=new_time.minute).isoformat()
+                new_rem["time"] = new_time.isoformat()
                 reminders.append(new_rem)
 
         if due_reminders:
-            random.shuffle(due_reminders)  # Хаотичный порядок
+            random.shuffle(due_reminders)
             await save_reminders()
 
         await asyncio.sleep(10)
@@ -233,3 +246,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
