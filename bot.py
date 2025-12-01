@@ -1,4 +1,4 @@
-# bot.py — Напоминалка с PostgreSQL и безопасным user_state
+# bot.py — Напоминалка с PostgreSQL и временем по МСК
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -6,9 +6,12 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 import asyncio
 import asyncpg
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from aiohttp import web
+
+# === ЧАСОВОЙ ПОЯС МСК ===
+MOSCOW_TZ = timezone(timedelta(hours=3))
 
 # === ЗАГРУЗКА ТОКЕНА И БД ===
 load_dotenv()
@@ -77,7 +80,8 @@ user_state = {}  # {user_id: {"step": "...", "data": ...}}
 @dp.message(Command("start"))
 async def start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я бот-напоминалка с базой данных. Напоминания не пропадут!",
+        "👋 Привет! Я бот-напоминалка.\n"
+        "⏰ Время по МСК",
         reply_markup=get_main_keyboard()
     )
 
@@ -97,7 +101,8 @@ async def get_message(message: types.Message):
         return
     user_id = message.from_user.id
     user_state[user_id] = {"step": "waiting_time", "message": text}
-    await message.answer("⏰ Введи время (чч:мм), например: 15:30")
+    await message.answer("⏰ Введи время (чч:мм), например: 15:30\n"
+                        "📌 Время по МСК")
 
 # === ОБРАБОТКА ВРЕМЕНИ ===
 @dp.message(lambda m: (user_state.get(m.from_user.id) or {}).get("step") == "waiting_time")
@@ -105,7 +110,7 @@ async def get_time(message: types.Message):
     user_id = message.from_user.id
     try:
         h, m = map(int, message.text.split(":"))
-        now = datetime.now()
+        now = datetime.now(MOSCOW_TZ)
         time = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if time < now:
             time += timedelta(days=1)
@@ -143,10 +148,10 @@ async def set_repeat(callback: types.CallbackQuery):
     await callback.message.edit_text(
         f"✅ Напоминание добавлено!\n"
         f"💬 {data['message']}\n"
-        f"⏰ {time_str}\n"
+        f"⏰ {time_str} (МСК)\n"
         f"🔄 {REPEAT_TYPES.get(repeat, 'Без повтора')}"
     )
-    user_state.pop(user_id, None)  # ✅ Безопасное удаление
+    user_state.pop(user_id, None)
     await callback.answer()
 
 # === ПОКАЗАТЬ НАПОМИНАНИЯ ===
@@ -162,12 +167,12 @@ async def show_reminders(message: types.Message):
         return
 
     for row in rows:
-        time_str = row["remind_time"].strftime("%d.%m %H:%M")
+        time_str = row["remind_time"].astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{row['id']}")]
         ])
         await message.answer(
-            f"🔔 {row['message']}\n⏰ {time_str}\n🔄 {REPEAT_TYPES.get(row['repeat'], 'Без повтора')}",
+            f"🔔 {row['message']}\n⏰ {time_str} (МСК)\n🔄 {REPEAT_TYPES.get(row['repeat'], 'Без повтора')}",
             reply_markup=kb
         )
 
@@ -185,11 +190,13 @@ async def delete_rem(callback: types.CallbackQuery):
 # === ФОН: ПРОВЕРКА И ПОВТОРЫ ===
 async def check_reminders():
     while True:
-        now = datetime.now()
+        now = datetime.now(MOSCOW_TZ)
         rows = await db_pool.fetch("SELECT * FROM reminders WHERE remind_time <= $1", now)
         for row in rows:
             try:
-                await bot.send_message(row["user_id"], f"🔔 Напоминание:\n{row['message']}")
+                remind_time = row["remind_time"].astimezone(MOSCOW_TZ)
+                if remind_time <= now:
+                    await bot.send_message(row["user_id"], f"🔔 Напоминание:\n{row['message']}")
             except Exception as e:
                 print(f"Ошибка отправки: {e}")
                 continue
@@ -233,5 +240,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
