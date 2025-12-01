@@ -1,4 +1,4 @@
-# bot.py — Напоминалка с PostgreSQL
+# bot.py — Напоминалка с PostgreSQL и безопасным user_state
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -8,6 +8,7 @@ import asyncpg
 import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from aiohttp import web
 
 # === ЗАГРУЗКА ТОКЕНА И БД ===
 load_dotenv()
@@ -41,10 +42,6 @@ async def init_db():
     ''')
 
 # === РАБОТА С НАПОМИНАНИЯМИ ===
-async def load_reminders():
-    async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT * FROM reminders ORDER BY remind_time")
-
 async def save_reminder(user_id, message, remind_time, repeat):
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -73,6 +70,9 @@ REPEAT_TYPES = {
     "none": "🚫 Без повтора"
 }
 
+# === ГЛОБАЛЬНОЕ ХРАНЕНИЕ СОСТОЯНИЙ ===
+user_state = {}  # {user_id: {"step": "...", "data": ...}}
+
 # === /start ===
 @dp.message(Command("start"))
 async def start(message: types.Message):
@@ -82,24 +82,25 @@ async def start(message: types.Message):
     )
 
 # === НОВОЕ НАПОМИНАНИЕ ===
-user_state = {}
-
 @dp.message(lambda m: m.text == "➕ Новое напоминание")
 async def start_remind(message: types.Message):
-    user_state[message.from_user.id] = {"step": "waiting_message"}
+    user_id = message.from_user.id
+    user_state[user_id] = {"step": "waiting_message"}
     await message.answer("📝 Введи сообщение:")
 
-@dp.message(lambda m: user_state.get(m.from_user.id, {}).get("step") == "waiting_message")
+# === ОБРАБОТКА СООБЩЕНИЯ ===
+@dp.message(lambda m: (user_state.get(m.from_user.id) or {}).get("step") == "waiting_message")
 async def get_message(message: types.Message):
     text = message.text.strip()
     if not text:
-        await message.answer("❌ Пусто.")
+        await message.answer("❌ Сообщение не может быть пустым.")
         return
     user_id = message.from_user.id
     user_state[user_id] = {"step": "waiting_time", "message": text}
     await message.answer("⏰ Введи время (чч:мм), например: 15:30")
 
-@dp.message(lambda m: user_state.get(m.from_user.id, {}).get("step") == "waiting_time")
+# === ОБРАБОТКА ВРЕМЕНИ ===
+@dp.message(lambda m: (user_state.get(m.from_user.id) or {}).get("step") == "waiting_time")
 async def get_time(message: types.Message):
     user_id = message.from_user.id
     try:
@@ -118,10 +119,11 @@ async def get_time(message: types.Message):
             [InlineKeyboardButton(text=REPEAT_TYPES["weekly"], callback_data="repeat_weekly")],
             [InlineKeyboardButton(text=REPEAT_TYPES["monthly"], callback_data="repeat_monthly")]
         ])
-        await message.answer("🔁 Повтор:", reply_markup=kb)
+        await message.answer("🔁 Выбери, как часто повторять:", reply_markup=kb)
     except:
-        await message.answer("❌ Формат: чч:мм")
+        await message.answer("❌ Неверный формат. Введи чч:мм (например, 09:00)")
 
+# === ВЫБОР ПОВТОРА ===
 @dp.callback_query(lambda c: c.data.startswith("repeat_"))
 async def set_repeat(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -137,18 +139,26 @@ async def set_repeat(callback: types.CallbackQuery):
         remind_time=data["remind_time"],
         repeat=repeat
     )
-    await callback.message.edit_text(f"✅ Напоминание добавлено!\n💬 {data['message']}\n⏰ {data['remind_time'].strftime('%d.%m %H:%M')}")
-    user_state[user_id] = None
+    time_str = data["remind_time"].strftime("%d.%m %H:%M")
+    await callback.message.edit_text(
+        f"✅ Напоминание добавлено!\n"
+        f"💬 {data['message']}\n"
+        f"⏰ {time_str}\n"
+        f"🔄 {REPEAT_TYPES.get(repeat, 'Без повтора')}"
+    )
+    user_state.pop(user_id, None)  # ✅ Безопасное удаление
     await callback.answer()
 
 # === ПОКАЗАТЬ НАПОМИНАНИЯ ===
 @dp.message(lambda m: m.text == "📋 Мои напоминания")
 async def show_reminders(message: types.Message):
     user_id = message.from_user.id
-    rows = await db_pool.fetch("SELECT id, message, remind_time, repeat FROM reminders WHERE user_id = $1", user_id)
-    
+    rows = await db_pool.fetch(
+        "SELECT id, message, remind_time, repeat FROM reminders WHERE user_id = $1 ORDER BY remind_time",
+        user_id
+    )
     if not rows:
-        await message.answer("📌 Нет напоминаний.")
+        await message.answer("📌 У тебя нет активных напоминаний.")
         return
 
     for row in rows:
@@ -157,31 +167,33 @@ async def show_reminders(message: types.Message):
             [InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{row['id']}")]
         ])
         await message.answer(
-            f"🔔 {row['message']}\n⏰ {time_str}\n🔄 {REPEAT_TYPES.get(row['repeat'], 'Без')}",
+            f"🔔 {row['message']}\n⏰ {time_str}\n🔄 {REPEAT_TYPES.get(row['repeat'], 'Без повтора')}",
             reply_markup=kb
         )
 
-# === УДАЛЕНИЕ ===
+# === УДАЛЕНИЕ ЧЕРЕЗ КНОПКУ ===
 @dp.callback_query(lambda c: c.data.startswith("delete_"))
 async def delete_rem(callback: types.CallbackQuery):
-    rem_id = int(callback.data.split("_")[1])
-    await delete_reminder_by_id(rem_id)
-    await callback.answer("✅ Удалено")
-    await callback.message.edit_text("❌ Удалено")
+    try:
+        rem_id = int(callback.data.split("_")[1])
+        await delete_reminder_by_id(rem_id)
+        await callback.answer("✅ Напоминание удалено")
+        await callback.message.edit_text("❌ Это напоминание удалено.")
+    except Exception as e:
+        await callback.answer("❌ Уже удалено")
 
-# === ФОН: ПРОВЕРКА НАПОМИНАНИЙ ===
+# === ФОН: ПРОВЕРКА И ПОВТОРЫ ===
 async def check_reminders():
     while True:
         now = datetime.now()
         rows = await db_pool.fetch("SELECT * FROM reminders WHERE remind_time <= $1", now)
         for row in rows:
             try:
-                await bot.send_message(row["user_id"], f"🔔 {row['message']}")
+                await bot.send_message(row["user_id"], f"🔔 Напоминание:\n{row['message']}")
             except Exception as e:
-                print(f"Ошибка: {e}")
+                print(f"Ошибка отправки: {e}")
                 continue
 
-            # Удаляем
             await delete_reminder_by_id(row["id"])
 
             # Повтор
@@ -199,8 +211,6 @@ async def check_reminders():
         await asyncio.sleep(10)
 
 # === МИНИ-СЕРВЕР ДЛЯ RENDER (асинхронный) ===
-from aiohttp import web
-
 app = web.Application()
 app.router.add_get("/", lambda _: web.Response(text="OK", status=200))
 app.router.add_get("/health", lambda _: web.Response(text="OK", status=200))
@@ -209,7 +219,7 @@ app.router.add_get("/health", lambda _: web.Response(text="OK", status=200))
 async def main():
     await init_db()
     asyncio.create_task(check_reminders())
-    
+
     # Запуск веб-сервера
     runner = web.AppRunner(app)
     await runner.setup()
