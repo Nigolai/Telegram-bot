@@ -1,4 +1,4 @@
-# bot.py — Напоминалка с PostgreSQL, временем по МСК и 24/7 работой
+# bot.py — Напоминалка с PostgreSQL, подпиской и вебхуком
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -28,6 +28,10 @@ if not DATABASE_URL:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# === НАСТРОЙКИ КАНАЛА ===
+CHANNEL_ID = -1003308523796  # Из твоих данных
+CHANNEL_URL = "https://t.me/CanalBotYspeh"  # Ссылка для кнопки
+
 # === ПОДКЛЮЧЕНИЕ К БАЗЕ ===
 db_pool = None
 
@@ -49,6 +53,27 @@ async def init_db():
     except Exception as e:
         print(f"❌ Ошибка подключения к БД: {e}")
 
+# === ПРОВЕРКА ПОДПИСКИ ===
+async def check_subscription(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception as e:
+        print(f"❌ Ошибка проверки подписки: {e}")
+        return False
+
+async def send_subscription_prompt(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Подписаться на канал", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_subscription")]
+    ])
+    await message.answer(
+        "👋 Привет! Чтобы пользоваться ботом, подпишись на наш канал:\n\n"
+        f"{CHANNEL_URL}\n\n"
+        "После этого нажми кнопку ниже 👇",
+        reply_markup=kb
+    )
+
 # === РАБОТА С НАПОМИНАНИЯМИ ===
 async def save_reminder(user_id, message, remind_time, repeat):
     async with db_pool.acquire() as conn:
@@ -61,9 +86,14 @@ async def delete_reminder_by_id(reminder_id):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM reminders WHERE id = $1", reminder_id)
 
-async def load_all_reminders():
+async def load_user_reminders(user_id):
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT * FROM reminders ORDER BY remind_time")
+        return await conn.fetch("""
+            SELECT id, message, remind_time, repeat 
+            FROM reminders 
+            WHERE user_id = $1 
+            ORDER BY remind_time
+        """, user_id)
 
 # === КНОПКИ ===
 def get_main_keyboard():
@@ -90,36 +120,82 @@ user_state = {}  # {user_id: {"step": "...", "data": ...}}
 async def start(message: types.Message):
     user_id = message.from_user.id
     user_state[user_id] = None
+
+    # Проверяем подписку
+    if not await check_subscription(user_id):
+        await send_subscription_prompt(message)
+        return
+
     print(f"👤 Пользователь {user_id} запустил бота")
     await message.answer(
-        "👋 Привет! Я бот-напоминалка.\n"
+        "🎉 Спасибо за подписку!\n\n"
+        "👋 Я бот-NapomniPro.\n"
         "⏰ Время по МСК",
         reply_markup=get_main_keyboard()
     )
+
+# === КНОПКА: ПРОВЕРКА ПОДПИСКИ ===
+@dp.callback_query(lambda c: c.data == "check_subscription")
+async def process_subscription_check(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    if await check_subscription(user_id):
+        user_state[user_id] = None
+        await callback.message.edit_text(
+            "✅ Отлично! Теперь ты можешь пользоваться ботом.",
+            reply_markup=None
+        )
+        await callback.message.answer(
+            "👋 Я бот-NapomniPro.\n"
+            "⏰ Время по МСК",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔔 Подписаться", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="✅ Проверить снова", callback_data="check_subscription")]
+        ])
+        await callback.message.edit_text(
+            "❌ Ты ещё не подписан на канал.\n\n"
+            "подпишись и нажми кнопку снова.",
+            reply_markup=kb
+        )
+    await callback.answer()
 
 # === НОВОЕ НАПОМИНАНИЕ ===
 @dp.message(lambda m: m.text == "➕ Новое напоминание")
 async def start_remind(message: types.Message):
     user_id = message.from_user.id
+    if not await check_subscription(user_id):
+        await send_subscription_prompt(message)
+        return
+
     user_state[user_id] = {"step": "waiting_message"}
     await message.answer("📝 Введи сообщение:")
 
 # === ОБРАБОТКА СООБЩЕНИЯ ===
 @dp.message(lambda m: (user_state.get(m.from_user.id) or {}).get("step") == "waiting_message")
 async def get_message(message: types.Message):
+    user_id = message.from_user.id
+    if not await check_subscription(user_id):
+        await send_subscription_prompt(message)
+        return
+
     text = message.text.strip()
     if not text:
         await message.answer("❌ Сообщение не может быть пустым.")
         return
-    user_id = message.from_user.id
     user_state[user_id] = {"step": "waiting_time", "message": text}
-    await message.answer("⏰ Введи время (чч:мм), например: 15:30\n"
-                        "📌 Время по МСК")
+    await message.answer("⏰ Введи время (чч:мм), например: 15:30\n📌 Время по МСК")
 
 # === ОБРАБОТКА ВРЕМЕНИ ===
 @dp.message(lambda m: (user_state.get(m.from_user.id) or {}).get("step") == "waiting_time")
 async def get_time(message: types.Message):
     user_id = message.from_user.id
+    if not await check_subscription(user_id):
+        await send_subscription_prompt(message)
+        return
+
     try:
         h, m = map(int, message.text.split(":"))
         now = datetime.now(MOSCOW_TZ)
@@ -137,13 +213,23 @@ async def get_time(message: types.Message):
             [InlineKeyboardButton(text=REPEAT_TYPES["monthly"], callback_data="repeat_monthly")]
         ])
         await message.answer("🔁 Выбери, как часто повторять:", reply_markup=kb)
-    except:
+    except(ValueError, IndexError):
         await message.answer("❌ Неверный формат. Введи чч:мм (например, 09:00)")
+   
+    except Exception as e:
+        print(f"🆘 Критическая ошибка: {e}")
+        await message.answer("❌ Ошибка. Админ уже чинит.")
+
 
 # === ВЫБОР ПОВТОРА ===
 @dp.callback_query(lambda c: c.data.startswith("repeat_"))
 async def set_repeat(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    if not await check_subscription(user_id):
+        await send_subscription_prompt(callback.message)
+        await callback.answer()
+        return
+
     data = user_state.get(user_id)
     if not data or data["step"] != "waiting_repeat":
         await callback.answer("❌ Сессия устарела.")
@@ -171,10 +257,11 @@ async def set_repeat(callback: types.CallbackQuery):
 @dp.message(lambda m: m.text == "📋 Мои напоминания")
 async def show_reminders(message: types.Message):
     user_id = message.from_user.id
-    rows = await db_pool.fetch(
-        "SELECT id, message, remind_time, repeat FROM reminders WHERE user_id = $1 ORDER BY remind_time",
-        user_id
-    )
+    if not await check_subscription(user_id):
+        await send_subscription_prompt(message)
+        return
+
+    rows = await load_user_reminders(user_id)
     if not rows:
         await message.answer("📌 У тебя нет активных напоминаний.")
         return
@@ -193,6 +280,12 @@ async def show_reminders(message: types.Message):
 # === УДАЛЕНИЕ ЧЕРЕЗ КНОПКУ ===
 @dp.callback_query(lambda c: c.data.startswith("delete_"))
 async def delete_rem(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if not await check_subscription(user_id):
+        await send_subscription_prompt(callback.message)
+        await callback.answer()
+        return
+
     try:
         rem_id = int(callback.data.split("_")[1])
         await delete_reminder_by_id(rem_id)
@@ -211,7 +304,7 @@ async def check_reminders():
         rows = await db_pool.fetch("SELECT * FROM reminders WHERE remind_time <= $1", now)
         for row in rows:
             try:
-                await bot.send_message(row["user_id"],f"{row['message']}")
+                await bot.send_message(row["user_id"], f"{row['message']}")
                 print(f"📨 Отправлено: {row['message']} (ID: {row['id']})")
             except Exception as e:
                 print(f"❌ Ошибка отправки: {e}")
@@ -263,7 +356,7 @@ async def main():
 
     # Веб-приложение
     app = web.Application()
-    app.router.add_post(f"/{TOKEN}", handle_webhook)  # Telegram будет слать сюда
+    app.router.add_post(f"/{TOKEN}", handle_webhook)
     app.router.add_get("/", lambda _: web.Response(text="OK", status=200))
     app.router.add_get("/health", lambda _: web.Response(text="OK", status=200))
 
