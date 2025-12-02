@@ -211,7 +211,7 @@ async def check_reminders():
         rows = await db_pool.fetch("SELECT * FROM reminders WHERE remind_time <= $1", now)
         for row in rows:
             try:
-                await bot.send_message(row["user_id"], f"🔔 Напоминание:\n{row['message']}")
+                await bot.send_message(row["user_id"],f"{row['message']}")
                 print(f"📨 Отправлено: {row['message']} (ID: {row['id']})")
             except Exception as e:
                 print(f"❌ Ошибка отправки: {e}")
